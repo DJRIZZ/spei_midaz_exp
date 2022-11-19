@@ -12,7 +12,7 @@ navbar:
   right:
   - icon: fab fa-github
     text: Source code
-    href: https://github.com/DJRIZ/spei_midaz_exp
+    href: https://github.com/DJRIZZ/spei_midaz_exp
 output:
   workflowr::wflow_html:
     toc: yes
