@@ -1,0 +1,811 @@
+---
+title: "Midazolam Experiment Data Summary and Analysis"
+author: "Dan Rizzolo"
+date: "Sept 13, 2019"
+site: workflowr::wflow_site
+output:
+  workflowr::wflow_html:
+    toc: false
+editor_options:
+  chunk_output_type: console
+---
+
+```{r setup, include=FALSE}
+library(knitr) # to run rmarkdown
+library(corrplot) # to create correlation plot 
+library(psych) # to create panel of histograms
+library(lme4) # package for fitting linear mixed effects models
+library(emmeans) # for looking at treatment means (new version of what was package lsmeans)
+library(jtools) # for formatting model output for rmarkdown document
+library(ggplot2) # for plotting
+library(bootpredictlme4) # bootstrapping CI's from mixed effects models
+```
+
+## The Plan
+
+The data summaries and analyses I present here were done with Program R and Rmarkdown in Rstudio to document the approach to the analysis, the r code (in grayed boxes), and output (lines starting with ##). R and Rmarkdown code files are archived on GitHub (https://github.com/DJRIZZ), if you'd like access, just let me know. Code, data files, Git versioning all managed through the workflowr package (loaded separately in the R Console).
+
+The analysis plan:
+
+1. Summarize response variables and examine correlations among them
+2. Summarize explanatory variables 
+3. Use linear mixed effects models to analyze each of the response variables we identified apriori as useful measures of the effect of midazolam: cort, pH, lactate. For the most supported model for each response, evaluate model assumptions and if model assumptions are met, estimate treatment effects at times of interest (average, arrival, induction).  
+4. Use a multivariate analysis to see if the suite of blood parameters, when examined together, separate the data by treatment.
+
+## Input files
+Four data files (all exported from the project database "spei_ptt_2018.accdb"):
+
+1. treat.csv - sex, site, mass, treatment
+2. blood.csv - blood values and sed scores
+3. cort.csv - blood cort values
+4. times.csv - dosing and sampling times for each bird
+
+```{r load data}
+capt <- read.csv("data/treat.csv") #data on captured birds, including treatment  (1 record per bird) NB coding of treatment control vs. saline
+blood <- read.csv("data/blood.csv") #blood values (2 records per bird)
+cort <- read.csv("data/cort.csv") #cort values (2 records per bird)
+times <- read.csv("data/times.csv") #times for captures, blood draw 1, blood draw 1, etc. (1 record per bird)
+
+# some data processing steps
+# pull out response variables: blood parameters + cort values
+y <- cbind(blood[,6:14], cort=(cort$cort_ng_ml))
+# make y numeric
+y <- data.matrix(y)
+
+# merge all data into one data frame: capture data, blood values, cort values
+all_data <- merge(blood, capt, all.x=TRUE)
+all_data <- merge(all_data, cort)
+```
+
+## Data summaries
+### Response variable summaries
+
+```{r y sum}
+y_sum <- summary(y)
+y_sum
+```
+### Response variable histograms
+
+Response variable distributions
+
+```{r pairs, fig.width=7, fig.height=5}
+# look at distributions
+dists <- multi.hist(y) #function is from r package psych
+```
+
+Distributions look reasonably normal, except Lactate, which is skewed low, and sed_score, which is an integer and so is not expected to be normally distributed. 
+
+### Response variable correlation plot
+
+Look at correlations among response variables as all were measured from the same set of individual birds.
+
+```{r corr plot, fig.width=7, fig.height=5}
+# check correlations among y variables
+# remove na records to allow calculating correlations
+y.na <- na.omit(y)
+r <- cor(y.na) #create correlation matrix among response variables
+r_plot <- corrplot(r, method="number", type="upper") #plot correlations using function from r package
+```
+
+No strong correlations among the responses we identified a priori: pH, lactate, and cort. Because they are not correlated, we can analyze each of these independently. High correlations between pH and pCO2, pCO2 and TCO2, BE and HCP3, etc. require that they be considered together using multivariate methods.
+
+A few more looks at the data...
+
+### Response variable box plots by treatment
+```{r boxplots}
+# box plots for response variables by treatment
+box_cort <- boxplot(all_data$cort_ng_ml~all_data$treatment, main="Cort")
+box_pH <- boxplot(all_data$pH~all_data$treatment, main="pH")
+box_lac <- boxplot(as.numeric(all_data$Lactate)~all_data$treatment, main="Lactate")
+```
+
+Looks like that, without accounting for the effect of time between dosing and sampling, cort was higher in controls than the treatment and that pH was higher in the controls than the treatment. Not much going on with lactate.
+
+To account for the effect of time, create variable for time between dosing and blood sampling for each measurement...
+
+Format date/times and calculate time intervals (in mins):
+
+* capt_inj: time from *capture* to dosing
+* capt_sample1: time from from *capture* to first blood sample
+* capt_sample2: time from *capture* to second blood sample
+* sample1_time: time from *dosing* to first blood sample
+* sample2_time: time from *dosing* to second blood sample
+
+```{r calculate times}
+# summarize explanatory variables: time and mass
+# first need to create sample.time variable: time elapsed in minutes between dosing and sampling using times data frame
+# str(times)#look at data - times are formatted as factors, need to format as date/time
+# first combine date with times (required for r to format them as dates/times)
+times$capt_time <- paste(times$date, times$capt_time) #time of capture
+times$inj_time <- paste(times$date, times$inj_time) #time of injection
+times$blood1_time <- paste(times$date, times$blood1_time) #time of blood sample 1 (arrival)
+times$blood2_time <- paste(times$date, times$blood2_time) #time of blood sample 2 (induction)
+#str(times) #check the changes
+
+# convert these to dates/times
+times$capt_time <- as.POSIXct(times$capt_time, format = "%m/%d/%Y %H:%M")
+times$inj_time <- as.POSIXct(times$inj_time, format = "%m/%d/%Y %H:%M")
+times$blood1_time <- as.POSIXct(times$blood1_time, format = "%m/%d/%Y %H:%M")
+times$blood2_time <- as.POSIXct(times$blood2_time, format = "%m/%d/%Y %H:%M")
+#check 
+#str(times)
+#summary(times)
+
+# calculate difference between times
+times$capt_inj <- difftime(times$inj_time, times$capt_time, units="mins") #time from capture to dosing
+times$capt_sample1 <- difftime(times$blood1_time, times$capt_time, units="mins") #time from capture to sample 1
+times$capt_sample2 <- difftime(times$blood2_time, times$capt_time, units="mins") #time from capture to sample 2
+times$sample1_time <- difftime(times$blood1_time, times$inj_time, units="mins") #time from dosing to sample 1
+times$sample2_time <- difftime(times$blood2_time, times$inj_time, units="mins") #time from dosing to sample 2
+
+# add time to all_data
+# pull out time columns into separate data frames with bird_id, then stack 'em and merge into all_data
+temp1 <- times[c("id_bird","sample1_time")] 
+names(temp1) <- c("id_bird", "time")
+temp1$sample <- "arrival"
+temp2 <- times[c("id_bird","sample2_time")] 
+names(temp2) <- c("id_bird", "time")
+temp2$sample <- "induction"
+temp3 <- rbind(temp1, temp2)
+all_data <- merge(all_data, temp3)
+all_data$time <- as.numeric(all_data$time)
+```
+
+### Capture and sampling time summaries
+
+```{r time sum}
+# summarize time
+time.sum <- times[ ,10:14]
+time.sum <- lapply(time.sum, as.numeric)
+time.sum <- unclass(time.sum)
+time.sum <- as.data.frame(time.sum)
+print(summary(time.sum))
+```
+
+Average time between capture and dosing was 8.9 min (range: 0 to 29 min). The first blood sample was collected an average of 41.7 min after dosing (range: 3 to 128 min), and the second blood sample an average of 99.4 min after dosing (range: 20 to 311 min).
+
+### Explanatory variable summaries
+
+Summary of body mass (g) and time since dosing (time, in minutes)
+```{r xvars}
+# summary for time and mass
+sum_time <- summary(all_data$time)
+sum_time
+sum_mass <- summary(all_data$mass_g)
+sum_mass
+```
+
+### Explanatory variable boxplots by treatment
+
+```{r xvar boxplots}
+box_time <- boxplot(all_data$time~all_data$treatment, main="Time")
+box_mass <- boxplot(all_data$mass~all_data$treatment, main="Mass")
+```
+
+Similar masses and times between dosing and sampling between treatments.
+
+### Explanatory variable histograms
+
+```{r xvar histograms}
+xvars <- cbind(all_data$time, all_data$mass_g)
+xvars <- as.data.frame(xvars)
+names(xvars) <- c("time","mass")
+xdists <- multi.hist(xvars) #function is from r package psych
+```
+
+Lots of variation in time between dosing and sampling, as expected differences in transport and holding. Not much variation in body mass. 
+
+### Sample size summary tables
+
+```{r, sum table}
+tab.ts1 <- table(all_data$treatment, all_data$sex)
+print(tab.ts1)
+
+tab.ts2 <- table(all_data$treatment, all_data$sex, all_data$sample)
+print(tab.ts2)
+```
+
+Similar M to F ratios in each treatment. Given the relatively small sample size, and without any hypothesized reason to expect a difference in the effect of midazolam between males and females, I did not consider sex as an explanatory variable. Further, body mass is primarily associated with sex.
+
+## Analysis of CORT
+
+We need to account for the effect of the time since dosing on the effect of midazolam. It was not possible to standardize transport and holding time, so time between dosing and sampling has a lot of variation and is best accounted for by treating it as continuous explanatory variable (rather than a categorical variable that classifies samples as "arrival" or "induction"). We expect that time will have a large influence on the effect of the treatment for midazolam-dosed birds but not the controls. To allow the effect of time to differ between treatments, I include time in the model as a main effect and as an interaction with treatment. 
+
+The distribution of time values creates a challenge in that most of the data were collected < 150 min after dosing, but there are some measurements out to 311 min. We expect that with time, cort responses in the two treatments will converge as the hypothesized effect of midazolam declines and cort values of the experimental birds increase. For the controls, their increased cort levels at capture will decrease from a maximum to some lower value. As a result, we expect the greatest difference between treatments in cort values will be at the sampling times closest to the dosing time. As time between dosing and sampling increases, we expect the cort levels in dosed birds to increase and the cort response in control birds to decrease. 
+
+If we had data uniformly distributed across the full range of sampling times, we could model this pattern and test the hypothesis based on the fit of the model to the data. Because most of the data are < 150 min, patterns in that part of the data set will dictate patterns in the sparser part > 150 min, likely even if we fit a model that allows nonlinear changes in cort with time for each treatment. 
+
+I include both linear and nonlinear interactions between treatment and time in the candidate models for cort. I suspect the data will support the less complex model given the sparsity in the data at times > 150 min. Regardless, most of what we can say from the data will relate to cort response between 0 and 150 min.
+
+We have 2 measurements for each individual bird in the data set. To account for the lack of independence between samples collected from the same individuals (samples from the same individual are likely to be correlated, or at least more correlated than 2 samples from 2 different birds), I fit a linear mixed effects model that includes a random effect of bird ID, the (1|bird_id) part of the model. This accounts for the repeated measures on birds.
+
+The model set includes the effects of treatment (midazolam, control), and time between dosing and blood sampling (time, in minutes) and their interaction: in one model as a linear change with time, and in another as a quadratic (nonlinear) change with time. The interactions permit the lines for each treatment in relation to time to have independent patterns (i.e., the model does not force them to be parallel as it would if it included only additive effects of treatment and time).
+
+To assess the fit of these 2 models, I also fit a model with only an intercept and random effect (i.e., it estimates only one mean value for the response). I used the AIC statistic (small sample size version, AICc) to compare these models relative to each other, given the data. 
+
+I base inference on model estimated parameters and their 95% confidence interval (CI) relative to zero, where each beta parameter quantifies the effect of the covariate and any beta parameter estimate that includes 0 in its 95% CI has no effect as a likely value.
+
+### Cort Model 1: linear change with time
+
+```{r cort m1 fit}
+# linear model
+cm1 <- lmer(cort_ng_ml~treatment + time + treatment*time + (1|id_bird), data=all_data, REML=FALSE)
+# pull out some output to use to calculate AICc later
+loglike <- logLik(cm1)[1]
+betaCM1 <- coef(summary(cm1))[ ,"Estimate"]
+k <- length(betaCM1)
+model <- "trt*time"
+
+# summary of model fit
+cm1.sum <- summary(cm1)
+print(cm1.sum, digits=3)
+```
+
+### Cort Model 2: quadratic change with time
+
+```{r cort m2 fit}
+# quadratic model
+cm2 <- lmer(cort_ng_ml~treatment + time + I(time^2) + treatment*time + treatment*I(time^2) + (1|id_bird), data=all_data, REML=FALSE)
+# pull out some output to use to calculate AICc later
+loglike <- append(loglike, logLik(cm2)[1])
+betaCM2 <- coef(summary(cm2))[ ,"Estimate"]
+k <- append(k, length(betaCM2))
+model <- append(model, "trt*time^2")
+ 
+# summary of model fit
+cm2.sum <- summary(cm2)
+print(cm2.sum, digits=3)
+```
+
+### Cort Model 3: null
+
+```{r cort M3 null model fit}
+# null model
+cm3 <- lmer(cort_ng_ml~ 1 + (1|id_bird), data=all_data, REML=FALSE)
+loglike <- append(loglike, logLik(cm3)[1])
+betaCM3 <- coef(summary(cm3))[ ,"Estimate"]
+k <- append(k, length(betaCM3))
+model <- append(model, "null")
+
+# summary of model fit
+cm3.sum <- summary(cm3)
+print(cm3.sum, digits=3)
+```
+
+### Cort AICc Model Selection
+
+```{r cort AICc}
+# create AICc table
+tableC <- data.frame(model)
+#tableC$LL<-loglike
+tableC$neg2LL <- loglike*-2 #calc negative 2 loglikelihood from log likelihood
+tableC$n <- nrow(all_data) #number of observations
+tableC$k <- k+2 #add 2 parameters for the random ID effect and the residual estimate
+tableC$AIC <- tableC$neg2LL + (2*tableC$k) #calculate AIC (not corrected for small sample)
+tableC$AICc <- tableC$AIC + ((2*tableC$k^2+2*tableC$k)/(tableC$n-tableC$k-1)) #calc AICc
+tableC$AICcmin <- min(tableC$AICc) #find smallest AICc value
+tableC$deltaAICc <- tableC$AICc-tableC$AICcmin #calc diff bt smallest AICc and each AICc
+tableC$odds <- exp(-0.5*tableC$deltaAICc) #calc model odds, need for model weights
+summodds <- sum(tableC$odds) #sum model odds
+tableC$AICcwt <- tableC$odds/summodds #calc AICc model weights=strength of support for each
+print(tableC, digits=2) #show table
+```
+
+The linear model has a the highest AICc model weight (0.81), indicating strong support from the data. If the effects of time and treatment were not different from zero, the linear treatment model and the null would have similar model weights, or the null would be strongly supported. Parameter estimates from the linear model all have 95% CI bound away from zero.
+
+### Cort model diagnostics
+Do the data meet the assumptions of the model?
+
+* equal variance of residuals from the linear model
+
+```{r cm1 diagnostics equal variance }
+#lmer model diagnostics: do the data meet the model assumptions?
+## standardized residuals versus fitted values by treatment
+plot(cm1, resid(., scaled=TRUE) ~ fitted(.) | treatment, abline = 0)
+```
+
+* normal distribution of residuals from the linear model
+
+```{r cm1 diag norm resids}
+require("lattice")
+qqmath(cm1, id=0.025)
+```
+
+* fit vs. predicted to assess model fit from the linear model
+
+```{r cm1 diag fit v resid}
+plot(cm1, cort_ng_ml ~ fitted(.), abline = c(0,1))
+```
+
+All diagnostics for the linear model look good.
+
+### Cort adjusted treatment means
+
+Estimate mean values of cort for each treatment at the average value of time (70.573 min), i.e., account for the effect of time on cort... 
+
+```{r cort means}
+#treatment means
+Ctrt.means<-emmeans(cm1, "treatment")
+print(Ctrt.means)
+Ctrt.contrast<-emmeans(cm1, pairwise~treatment)
+print(Ctrt.contrast)
+plot(Ctrt.means)
+```
+
+At 70.6 minutes after doses were administered, midazolam reduced average cort levels by 20.6% (18 ng/mL) compared to controls that were given saline. The confidence interval around the difference between treatment means was bound away from zero (0.556, 35.44), providing strong inference that midazolam reduced cort levels.
+
+### Cort treatment means at average arrival and induction times
+
+```{r cort vs time by treat plot}
+#mean treatment values and contrasts at set values of time (where time=42 is average time to arrival, and time=99 is average time to induction)
+#means @42 min
+cm1.mt42<-emmeans(cm1, "treatment", at=list(time=42))
+cm1.mt42
+#contrasts @ 42 min
+cm1.ct42<-emmeans(cm1, pairwise~treatment, at=list(time=42))
+cm1.ct42
+#means at 99 min
+cm1.mt99<-emmeans(cm1, "treatment", at=list(time=99))
+cm1.mt99
+#contrasts@ 99 min
+cm1.ct99<-emmeans(cm1, pairwise~treatment, at=list(time=99))
+cm1.ct99
+```
+
+At the average arrival time (42 min), mean cort was 24.8 ng/mL higher in the control group than the treatment group. The 95% CI around this difference did not include zero (6.75, 42.85).
+
+At the average induction time, mean cort was 11.2 ng/ul higher in the control group than the treatment group; however, the 95% CI around this difference overlapped zero (-6.83, 29.23), preventing strong inference of a treatment effect on cort at 90 min post dosing. Thus, by the time of induction, the effect of midazolam had attenuated.
+
+### Plot of cort vs. time by treatment from linear model
+
+Cort response in relation to time for each treatment using the linear model.
+
+```{r cort plot fitted values, message=FALSE, warning=FALSE}
+#fitted values from linear model: cort vs. time
+#make new data with values for which model estimates (i.e., predicts, fits) cort
+m1newdata<-data.frame(c("midazolam", "control"), time=rep(rep(1:311, each=2),1))
+names(m1newdata)<-c("treatment","time")
+```
+
+Bootstrap resampling to get 95% CI for model predicted values from the linear mixed effects model.
+
+```{r bootstrap confidence intervals for cort, fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+#predictions with 95% CI from lmer: http://www.remkoduursma.com/post/2017-06-15-bootpredictlme4/
+library(merTools) #load this here, else it crashes corrplot
+#find random intercept bird that is average
+averageObs(cm1) #this is "ref level" bird ID
+#add this to the new data set for prediction
+id_bird<-rep("1987-29011", 622)
+#add random effect to new data data frame
+m1newdata$id_bird<-id_bird
+cm1.fitCI<-predictInterval(cm1, newdata=m1newdata, which="fixed",
+                                                     level=0.95, n.sims=1000, stat="median",
+                                                     include.resid.var=F)
+                           
+#join new data and predictInterval output
+cm1.fitCI<-cbind(m1newdata,cm1.fitCI)
+
+#plot fitted values and CI with data
+p.cm1fitCI<-ggplot()+
+  geom_line(data=cm1.fitCI, aes(time, fit, color=treatment), size=2)+
+  geom_line(data=cm1.fitCI, aes(time, lwr, color=treatment))+
+  geom_line(data=cm1.fitCI, aes(time, upr, color=treatment))+
+  geom_ribbon(data=cm1.fitCI, aes(x=time, ymin=lwr, ymax=upr, fill=treatment), 
+              alpha=0.2, 
+              linetype=0,
+              size=0.5)+
+  geom_point(data=all_data,aes(time, cort_ng_ml, color=treatment), size=4)+
+  labs(x="Time since dosing (min)", y="Cort (ng/mL)")+
+  theme_bw()
+p.cm1fitCI
+
+detach("package:merTools", unload=TRUE)
+
+```
+
+```{r cort fitted values}
+### Predicted cort values for treatments from all times from the linear model
+#print(cm1.fitCI)
+```
+
+### Cort results summary
+We measured cort levels in blood samples from 41 spectacled eiders, 20 dosed with midazolam and 21 dosed with saline. Birds were dosed 8 min after capture, on average (range: 3 to 28 min). We collected two blood samples from each bird, the first an average of 41.7 min after dosing (range 3 to 128 min), when transported birds arrived at the field camp, and 99.4 min (range: 20 to 311 min) when anesthesia was induced for surgery.
+
+The model specifying a linear interaction between treatment time since dosing was most supported by the data (AICc weight 0.81). Cort levels changed linearly with time since dosing in both treatments, but in opposite directions. At the average time of arrival at the surgical facility (42 min), average cort values were 24.8 ng/mL (95% CI: 6.75, 42.85) in the control treatment (93.9 ng/mL, 95% CI 81.4, 106.4 ug/mL) compared to the midazolam treatment (69.1 ng/mL, 95% CI 56.1, 82.1 ug/mL). At the average time of anesthetic induction, average cort level of the control group (86.7, 95% CI 74.1, 99.3 ug/mL) were no longer different from the average cort level of the midazolam treatment (75.5 ug/mL, 95% CI 62.7, 88.4 ug/mL).
+
+## Analysis of Lactate
+
+### Lactate summary
+
+```{r sum lactate}
+summary(all_data$Lactate)
+```
+Note 2 sampled birds without lacate values, need to remove these records.
+
+### Take a look at the distribution of lactate values:
+```{r lactate distribution}
+#2 records with NA for lactate, remove these
+all_data2<-na.omit(all_data)
+hist(all_data2$Lactate)
+```
+
+It looks a bit skewy, use a natural log transformation to pull the long tail in...
+```{r lactate log transform}
+lnLactate<-log(all_data2$Lactate)
+hist(lnLactate)
+```
+
+Log transform looks good. With a log transformation, backtransformation to the original scale provides inference to median values, not means. Continue with fitting linear mixed models, as done for cort:
+
+### Lactate Model 1: linear change with time
+
+```{r lactate m1}
+#linear model
+lm1<-lmer(log(Lactate)~treatment + time + treatment*time + (1|id_bird), data=all_data2, REML=FALSE)
+#pull out some output to use to calculate AICc later
+loglike<-logLik(lm1)[1]
+betalm1<-coef(summary(lm1))[ ,"Estimate"]
+k<-length(betalm1)
+model<-"trt*time"
+#summary of model fit
+lm1.sum<-summary(lm1)
+print(lm1.sum, digits=3)
+lm1CI<-confint(lm1)
+print(lm1CI, digits=1)
+```
+
+### Lactate Model 2: quadratic change with time
+
+```{r lactate m2 fit}
+#quadratic model
+lm2<-lmer(log(Lactate)~treatment + time + I(time^2) + treatment*time + treatment*I(time^2) + (1|id_bird), data=all_data2, REML=FALSE)
+#pull out some output to use to calculate AICc later
+loglike<-append(loglike, logLik(lm2)[1])
+betalm2<-coef(summary(lm2))[ ,"Estimate"]
+k<-append(k, length(betalm2))
+model<-append(model, "trt*time2")
+
+#summary of model fit
+lm2.sum<-summary(lm2)
+print(lm2.sum, digits=3)
+```
+
+### Lactate Model 3: null
+
+```{r lactate M3 null model fit}
+#null model
+lm3<-lmer(log(Lactate)~ 1 + (1|id_bird), data=all_data2, REML=FALSE)
+loglike<-append(loglike, logLik(lm3)[1])
+betalm3<-coef(summary(lm3))[ ,"Estimate"]
+k<-append(k, length(betalm3))
+model<-append(model, "null")
+```
+
+### Lactate AICc Model Selection
+
+```{r lactate model selection}
+#summary of model fit
+lm3.sum<-summary(lm3)
+print(lm3.sum, digits=3)
+
+#create AICc table
+tableL<-data.frame(model)
+#tableL$LL<-loglike
+tableL$neg2LL<-loglike*-2 #calc negative 2 loglikelihood from log likelihood
+tableL$n<-nrow(all_data2) #number of observations
+tableL$k<-k+2 #add 2 parameters for the random ID effect and the residual estimate
+tableL$AIC<-tableL$neg2LL + (2*tableL$k) #calculate AIC (not corrected for small sample)
+tableL$AICc<-tableL$AIC + ((2*tableL$k^2+2*tableL$k)/(tableL$n-tableL$k-1)) #calc AICc
+tableL$AICcmin<-min(tableL$AICc) #find smallest AICc value
+tableL$deltaAICc<-tableL$AICc-tableL$AICcmin #calc diff bt smallest AICc and each AICc
+tableL$odds<-exp(-0.5*tableL$deltaAICc) #calc model odds, need for model weights
+summodds<-sum(tableL$odds) #sum model odds
+tableL$AICcwt<-tableL$odds/summodds #calc AICc model weights=strenght of support for each
+print(tableL[order(tableL$deltaAICc),], digits=2) #show table
+```
+
+The null model was most supported by the data (model weight 0.50) indicating that neither treatment or time clearly captured variation in log lactate values. The linear model received some support from the data (model weight 0.30), indicating that although there was no clear association between log lactate and the explanatory variables in the model, the absence of a relationship was also not clear; thus the result is ambiguous and warrants further examination.
+
+### Lactate model diagnostics
+
+Do the data meet the assumptions of the model?
+
+* equal variance of residuals from the linear model
+
+```{r lm1 diagnostics equal variance }
+#lmer model diagnostics: do the data meet the model assumptions?
+## standardized residuals versus fitted values by treatment
+plot(lm1, resid(., scaled=TRUE) ~ fitted(.) | treatment, abline = 0)
+```
+
+* normal distribution of residuals from the linear model
+
+```{r lm1 diag norm resids}
+qqmath(lm1, id=0.025)
+```
+
+* fit vs. predicted to assess model fit from the linear model
+
+```{r lm1 diag fit v resid}
+plot(lm1, log(Lactate) ~ fitted(.), abline = c(0,1))
+```
+
+Residual variance and normal distribution look good. Fit is not great, but this is not surprising given that the null model received the most support from the data.
+
+### Lactate adjusted treatment means
+
+Plot mean log(lactate) for each treatment at the average value of time. 
+
+```{r lactate means}
+#treatment means
+LM1trt.means<-emmeans(lm1, "treatment")
+print(LM1trt.means)
+LM1.contrast<-emmeans(lm1, pairwise~treatment)
+#plot treatment means and 95% CI
+plot(LM1trt.means)
+```
+
+At the average value of time, there was no difference between treatments (difference between treatment means on log scale: 0.23, 95% CI -0.04, 0.51; log lactate values were similar between the control treatment (1.43, 95% CI 1.23, 1.63) and the midazolam treatment (1.20, 95% CI 1.00, 1.39). On the original scale, median lactate values estimate from the model are: control 4.18 (95% CI 3.42, 5.10), midazolam 3.32 (95% CI 2.72, 4.01).
+
+### Lactate treatment means at average arrival and induction times
+
+```{r lactate means at specified time values}
+#mean treatment values and contrasts at set values of time (where time=42 is average time to arrival, and time=99 is average time to induction)
+#means @ 42 min
+lm1.mt42<-emmeans(lm1, "treatment", at=list(time=42))
+lm1.mt42
+#contrasts @ 42 min
+lm1.ct42<-emmeans(lm1, pairwise~treatment, at=list(time=42))
+lm1.ct42
+#mean @ 99 min
+lm1.mt99<-emmeans(lm1, "treatment", at=list(time=99))
+lm1.mt99
+#contrasts @ 99 min
+lm1.ct99<-emmeans(lm1, pairwise~treatment, at=list(time=99))
+lm1.ct99
+```
+
+At the average arrival time, log lactate was higher by 0.34 (95% CI 0.04, 0.63) in the control treatment (1.47, 95% CI 1.26, 1.68) than in the midazolam treatment (1.13, 95% CI 0.92, 1.34). On the orignal scale, median lactate values from the model for each treatment are: control 4.35 (3.53, 5.37), midazolam 3.10 (2.50, 3.82). [Is a difference of 1.25 whatever the units for lactate are biologically important?]
+
+At the average time of induction, log lactate did not differ between treatments (difference between treatments on the log scale = 0.12, 95% CI -0.17, 0.42). On the orignal scale, treatment median values estimated from the model are: control 4.01 (95% CI 3.25, 4.95), midazolam 3.56 (95% CI 2.89, 4.39).
+
+### Plot log(lactate) for each treatment against time
+
+```{r lactate vs. time for each treat, fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+#fitted values from linear model: lactate vs. time
+#make new data with values for which model estimates (i.e., predicts, fits) lactate
+lm1newdata<-data.frame(c("midazolam", "control"), time=rep(rep(1:311, each=2),1))
+names(lm1newdata)<-c("treatment","time")
+m1lac_fit<-as.data.frame((predict(lm1, newdata=lm1newdata, re.form=NA)))
+lm1fit<-cbind(lm1newdata, m1lac_fit)
+names(lm1fit)<-c("treatment","time","pred")
+lm1fit<-as.data.frame(lm1fit)
+
+#predictions with MerMod to get 95% CIs
+#find random intercept bird that is average
+#averageObs(lm1) #this is the only way to get SEs on fixed effects, include "ref level" bird ID
+#add this to the new data set for prediction
+id_bird<-rep("2007-04138", 622)
+#add random effect to new data data frame
+lm1newdata$id_bird<-id_bird
+
+#a way forward for predicting from lmer: http://www.remkoduursma.com/post/2017-06-15-bootpredictlme4/
+library(merTools)
+lm1.fitCI<-predictInterval(lm1, newdata=lm1newdata, which="fixed",
+                           level=0.95, n.sims=1000, stat="median",
+                           include.resid.var=F)
+
+#join new data and predictInterval output
+lm1.fitCI<-cbind(lm1newdata,lm1.fitCI)
+#remove dup columns
+#lm1.fitCI<-cbind(lm1.fitCI[4:9]) 
+
+p.lm1fitCI<-ggplot()+
+  geom_line(data=lm1.fitCI, aes(time, fit, color=treatment), size=2)+
+  geom_line(data=lm1.fitCI, aes(time, lwr, color=treatment))+
+  geom_line(data=lm1.fitCI, aes(time, upr, color=treatment))+
+  geom_ribbon(data=lm1.fitCI, aes(x=time, ymin=lwr, ymax=upr, fill=treatment), 
+              alpha=0.2, 
+              linetype=0,
+              size=0.5)+
+  geom_point(data=all_data2,aes(time, log(Lactate), color=treatment), size=4)+
+  labs(x="Time since dosing (min)", y="log(Lactate)")+
+  theme_bw()
+p.lm1fitCI
+
+detach("package:merTools", unload=TRUE)
+```
+
+Same general pattern in the data as cort, but with more variation (values of lactate overlap between treatments more than for cort).
+
+### Lactate results summary
+We did not find strong evidence of an association between treatment and log values of lactate as both the null model, specifying a single value for log lactate, and linear model, that varied by treatment across sampling times, received support from the data (AICc model weights 0.50 vs. 0.38). Based on the linear model, we found evidence of a small difference in median lactate values between treatments at the average time of arrival (controls 4.35, 95% CI 3.53, 5.37; midazolam 3.56, 95% CI 2.89, 4.39); however, this difference is not likely biologically important (??). Median lactate levels did not differ at the average time of induction (control 4.01, 95% CI 3.25, 4.95; midazolam 3.56, 95% CI 2.89, 4.39).
+
+## Analysis of pH
+
+### pH Model 1: linear change with time
+
+```{r pH m1 fit}
+#linear model
+cm1<-lmer(pH~treatment + time + treatment*time + (1|id_bird), data=all_data, REML=FALSE)
+#pull out some output to use to calculate AICc later
+loglike<-logLik(cm1)[1]
+betaCM1<-coef(summary(cm1))[ ,"Estimate"]
+k<-length(betaCM1)
+model<-"trt*time"
+
+#summary of model fit
+cm1.sum<-summary(cm1)
+print(cm1.sum, digits=3)
+```
+
+### pH Model 2: quadratic change with time
+
+```{r pH m2 fit}
+#quadratic model
+cm2<-lmer(pH~treatment + time + I(time^2) + treatment*time + treatment*I(time^2) + (1|id_bird), data=all_data, REML=FALSE)
+#pull out some output to use to calculate AICc later
+loglike<-append(loglike, logLik(cm2)[1])
+betaCM2<-coef(summary(cm2))[ ,"Estimate"]
+k<-append(k, length(betaCM2))
+model<-append(model, "trt*time^2")
+ 
+#summary of model fit
+cm2.sum<-summary(cm2)
+print(cm2.sum, digits=3)
+```
+
+### pH Model 3: null
+
+```{r pH M3 null model fit}
+#null model
+cm3<-lmer(pH~ 1 + (1|id_bird), data=all_data, REML=FALSE)
+loglike<-append(loglike, logLik(cm3)[1])
+betaCM3<-coef(summary(cm3))[ ,"Estimate"]
+k<-append(k, length(betaCM3))
+model<-append(model, "null")
+
+#summary of model fit
+cm3.sum<-summary(cm3)
+print(cm3.sum, digits=3)
+```
+
+### pH AICc Model Selection
+
+```{r pH AICc}
+#create AICc table
+tableC<-data.frame(model)
+#tableC$LL<-loglike
+tableC$neg2LL<-loglike*-2 #calc negative 2 loglikelihood from log likelihood
+tableC$n<-nrow(all_data) #number of observations
+tableC$k<-k+2 #add 2 parameters for the random ID effect and the residual estimate
+tableC$AIC<-tableC$neg2LL + (2*tableC$k) #calculate AIC (not corrected for small sample)
+tableC$AICc<-tableC$AIC + ((2*tableC$k^2+2*tableC$k)/(tableC$n-tableC$k-1)) #calc AICc
+tableC$AICcmin<-min(tableC$AICc) #find smallest AICc value
+tableC$deltaAICc<-tableC$AICc-tableC$AICcmin #calc diff bt smallest AICc and each AICc
+tableC$odds<-exp(-0.5*tableC$deltaAICc) #calc model odds, need for model weights
+summodds<-sum(tableC$odds) #sum model odds
+tableC$AICcwt<-tableC$odds/summodds #calc AICc model weights=strenght of support for each
+print(tableC, digits=2) #show table
+```
+
+The quadratic model has a the highest AICc model weight (0.968), indicating strong support from the data. 
+
+### pH model diagnostics
+Do the data meet the assumptions of the model?
+
+* equal variance of residuals from the quadratic model
+
+```{r cm2 diagnostics equal variance }
+#lmer model diagnostics: do the data meet the model assumptions?
+## standardized residuals versus fitted values by treatment
+plot(cm2, resid(., scaled=TRUE) ~ fitted(.) | treatment, abline = 0)
+```
+
+* normal distribution of residuals from the quadratic model
+
+```{r cm2 diag norm resids}
+require("lattice")
+qqmath(cm2, id=0.025)
+```
+
+* fit vs. predicted to assess model fit from the quadratic model
+
+```{r cm2 diag fit v resid}
+plot(cm2, pH ~ fitted(.), abline = c(0,1))
+```
+
+All look reasonably good.
+
+### pH adjusted treatment means
+
+Estimate mean values of pH for each treatment at the average value of time (70.573 min), i.e., account for the effect of time on pH 
+
+```{r pH means}
+#treatment means
+Ctrt.means<-emmeans(cm2, "treatment")
+print(Ctrt.means)
+Ctrt.contrast<-emmeans(cm2, pairwise~treatment)
+plot(Ctrt.means)
+```
+
+At 70.6 minutes after the dose was administered, midazolam decreased blood pH by 0.0684 compared to controls that were given saline. The confidence interval around the difference between treatment means was bound away from zero (0.0254, 0.1114), providing strong inference that midazolam reduced blood pH levels.
+
+### pH treatment means at average arrival and induction times
+
+```{r pH vs time by treat plot}
+#mean treatment values and contrasts at set values of time (where time=42 is average time to arrival, and time=99 is average time to induction)
+#means @ 42 min
+cm2.mt42<-emmeans(cm2, "treatment", at=list(time=42))
+cm2.mt42
+#contrasts @ 42 min
+cm2.ct42<-emmeans(cm2, pairwise~treatment, at=list(time=42))
+cm2.ct42
+#means @ 99 min
+cm2.mt99<-emmeans(cm2, "treatment", at=list(time=99))
+cm2.mt99
+#contrasts @ 99 min
+cm2.ct99<-emmeans(cm2, pairwise~treatment, at=list(time=99))
+cm2.ct99
+```
+
+At the average arrival time (42 min), mean blood pH was 0.063 higher in the control group than the treatment group. The 95% CI around this difference did not include zero (0.0224, 0.1036), providing strong inference that midazolam reduced blood pH levels.
+
+At the average induction time, mean blood pH was 0.0731 higher in the control group than the treatment group; the 95% CI around this difference did not include zero (0.0151, 0.1311), providing strong inference that midazolam reduced blood pH levels.
+
+### Plot of pH vs. time by treatment from the quadratic model
+
+pH response in relation to time for each treatment using the linear model.
+
+```{r pH plot fitted values, message=FALSE, warning=FALSE}
+#fitted values from linear model: pH vs. time
+#make new data with values for which model estimates (i.e., predicts, fits) pH
+m2newdata<-data.frame(c("midazolam", "control"), time=rep(rep(1:311, each=2),1))
+names(m2newdata)<-c("treatment","time")
+```
+
+Bootstrap resampling to get 95% CI for model predicted values from the linear mixed effects model.
+
+```{r bootstrap confidence intervals for pH, fig.width=7, fig.height=5, message=FALSE, warning=FALSE}
+#predictions with 95% CI from lmer: http://www.remkoduursma.com/post/2017-06-15-bootpredictlme4/
+library(merTools) #load this here, else it crashes corrplot
+#find random intercept bird that is average
+averageObs(cm2) #this is "ref level" bird ID
+#add this to the new data set for prediction
+id_bird<-rep("1987-29011", 622)
+#add random effect to new data data frame
+m2newdata$id_bird<-id_bird
+cm2.fitCI<-predictInterval(cm2, newdata=m1newdata, which="fixed",
+                                                     level=0.95, n.sims=1000, stat="median",
+                                                     include.resid.var=F)
+                           
+#join new data and predictInterval output
+cm2.fitCI<-cbind(m2newdata,cm2.fitCI)
+
+#plot fitted values and CI with data
+p.cm2fitCI<-ggplot()+
+  geom_line(data=cm2.fitCI, aes(time, fit, color=treatment), size=2)+
+  geom_line(data=cm2.fitCI, aes(time, lwr, color=treatment))+
+  geom_line(data=cm2.fitCI, aes(time, upr, color=treatment))+
+  geom_ribbon(data=cm2.fitCI, aes(x=time, ymin=lwr, ymax=upr, fill=treatment), 
+              alpha=0.2, 
+              linetype=0,
+              size=0.5)+
+  geom_point(data=all_data,aes(time, pH, color=treatment), size=4)+
+  labs(x="Time since dosing (min)", y="pH")+
+  theme_bw()
+p.cm2fitCI
+
+detach("package:merTools", unload=TRUE)
+
+```
+
+```{r pH fitted values}
+### Predicted pH values for treatments from all times from the linear model
+#print(cm2.fitCI)
+```
+
+### pH results summary
+The model specifying a quadratic interaction between the blood pH values of treatments and time since dosing was most supported by the data (AICc weight 0.97). This model permitted the shape of the curvilinear association between blood pH and time since dosing to differ between treatments. Patterns in blood pH over time, however, were similar in the control and treatment groups with blood pH highest at times closest to dosing, then declinging until around 150 minutes after dosing. There was an apparent increase in blood pH after 150 minutes, however we had few samples collected after 150 minutes to describe this pattern reliably.
+
+Average blood pH was consistently lower in the midazolam treatment than the control treatment across sampling times. At the average time of arrival at the surgical facility (42 min), average pH values were 7.41 (95% CI: 7.38, 7.44) in the control treatment and 7.35 (95% CI: 7.32, 7.38) in the midazolam treatment. At the average time of anesthetic induction, average pH of the midazolam treatment (7.29, 95% CI: 7.25, 7.33) remained lower than the control group (7.37, 95% CI: 7.32, 7.41).
