@@ -8,7 +8,9 @@ editor_options:
   chunk_output_type: console
 ---
 
-Archive for files associated with:
+Archive R code associated with:
 Spriggs, M.C., D.J. Rizzolo, K.H. Martin, G.E. Myers, and M.G. Sexson. 2021. Effects of midazolam on corticosterone and blood gases in spectacled eiders prior to transmitter implanatation. Journal of Wildlife Management: doi 10.1002/jwmg.22046
+
+Data sets required to run this code are archived on the U.S. Fish and Wildlife Service Alaska Regional Data Repository and available on request. Contact: daniel_rizzolo@fws.gov
 
 * [Data Summaries and Results](midaz_data_summary_workflowr.html)
