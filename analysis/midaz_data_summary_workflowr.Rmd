@@ -30,7 +30,6 @@ The analysis plan:
 1. Summarize response variables and examine correlations among them
 2. Summarize explanatory variables 
 3. Use linear mixed effects models to analyze each of the response variables we identified apriori as useful measures of the effect of midazolam: cort, pH, lactate. For the most supported model for each response, evaluate model assumptions and if model assumptions are met, estimate treatment effects at times of interest (average, arrival, induction).  
-4. Use a multivariate analysis to see if the suite of blood parameters, when examined together, separate the data by treatment.
 
 ## Input files
 Four data files (all exported from the project database "spei_ptt_2018.accdb"):

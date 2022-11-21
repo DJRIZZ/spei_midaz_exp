@@ -7,4 +7,12 @@ editor_options:
   chunk_output_type: console
 ---
 
-Describe your project.
+Preliminary data summaries and final data analysis for a project looking at the efficacy of intra-muscular midazolam administered at capture for reducing stress and exertion in wild-caught spectacled eiders prior to surgery to implant satellite transmitters.
+
+Citation:
+Spriggs, M.C., D.J. Rizzolo, K.H. Martin, G.E. Myers, and M.G. Sexson. 2021. Effects of midazolam on corticosterone and blood gases in spectacled eiders prior to transmitter implanatation. Journal of Wildlife Management: doi 10.1002/jwmg.22046
+
+Link:
+https://wildlife.onlinelibrary.wiley.com/doi/abs/10.1002/jwmg.22046
+
+All R code written by Dan Rizzolo: daniel_rizzolo@fws.gov
